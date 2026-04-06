@@ -729,6 +729,7 @@ java_library(
         "//src/main/protobuf:execution_graph_java_proto",
         "//src/main/protobuf:execution_graph_writer_java_proto",
         "//src/main/protobuf:failure_details_java_proto",
+        "//third_party:fastutil",
         "//third_party:flogger",
         "//third_party:guava",
         "//third_party:jsr305",

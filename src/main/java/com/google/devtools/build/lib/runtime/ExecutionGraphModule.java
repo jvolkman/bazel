@@ -14,6 +14,7 @@
 package com.google.devtools.build.lib.runtime;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 import com.github.luben.zstd.ZstdOutputStream;
@@ -78,11 +79,11 @@ import com.google.devtools.common.options.OptionEffectTag;
 import com.google.devtools.common.options.OptionsBase;
 import com.google.devtools.common.options.OptionsParsingResult;
 import com.google.protobuf.CodedOutputStream;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntArrays;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -632,13 +633,15 @@ public class ExecutionGraphModule extends BlazeModule {
       }
 
       NestedSetBuilder<Artifact> runfilesArtifactsBuilder = NestedSetBuilder.stableOrder();
+      ImmutableList<? extends ActionInput> inputsList = inputs.toList();
+      IntArrayList deps = new IntArrayList(inputsList.size());
 
-      // Don't store duplicate deps. This saves some storage space, and uses less memory when the
-      // action dump is parsed. Using a TreeSet is not slower than a HashSet, and it seems that
-      // keeping the deps ordered compresses better. See cl/377153712.
-      Set<Integer> deps = new TreeSet<>();
+      // Track the previous dep index to reduce the number of duplicates added to deps. Duplicates
+      // are often seen consecutively due to NestedSet structure (e.g. when all outputs of an action
+      // are added as inputs).
+      int previousDepIndex = -1;
 
-      for (ActionInput input : inputs.toList()) {
+      for (ActionInput input : inputsList) {
         // We don't use inputMetadataProvider.getRunfilesTrees() because this method is called both
         // for Spawns and Actions and the runfiles on a Spawn can be a subset of the runfiles of the
         // action during whose execution it was created.
@@ -653,21 +656,35 @@ public class ExecutionGraphModule extends BlazeModule {
         }
 
         if (depType == DependencyInfo.ALL) {
-          maybeAddArtifactDependency(deps, input);
+          NodeInfo dep = outputToNode.get(input);
+          if (dep != null && dep.index != previousDepIndex) {
+            deps.add(dep.index);
+            previousDepIndex = dep.index;
+          }
         }
       }
 
-      for (Artifact runfilesInput : runfilesArtifactsBuilder.build().toList()) {
-        maybeAddArtifactDependency(deps, runfilesInput);
+      inputsList = runfilesArtifactsBuilder.build().toList();
+      deps.ensureCapacity(deps.size() + inputsList.size());
+      for (ActionInput runfilesInput : inputsList) {
+        NodeInfo dep = outputToNode.get(runfilesInput);
+        if (dep != null && dep.index != previousDepIndex) {
+          deps.add(dep.index);
+          previousDepIndex = dep.index;
+        }
       }
 
-      nodeBuilder.addAllDependentIndex(deps);
-    }
-
-    private void maybeAddArtifactDependency(Set<Integer> deps, ActionInput input) {
-      NodeInfo dep = outputToNode.get(input);
-      if (dep != null) {
-        deps.add(dep.index);
+      // Sort and deduplicate. Compression is more effective when the data is sorted.
+      int size = deps.size();
+      int[] elems = deps.elements();
+      IntArrays.radixSort(elems, 0, size);
+      previousDepIndex = -1;
+      for (int i = 0; i < size; i++) {
+        int depIndex = elems[i];
+        if (depIndex != previousDepIndex) {
+          nodeBuilder.addDependentIndex(depIndex);
+          previousDepIndex = depIndex;
+        }
       }
     }
 
@@ -744,6 +761,7 @@ public class ExecutionGraphModule extends BlazeModule {
       this.thread.start();
     }
 
+    @SuppressWarnings("StopwatchElapsedMillis") // Avoids garbage from Duration objects.
     void enqueueBytes(byte[] entry) {
       if (queuedBytesSemaphore != null && entry.length > 0) {
         int permits = numPermits(entry);
@@ -757,7 +775,7 @@ public class ExecutionGraphModule extends BlazeModule {
             Thread.currentThread().interrupt();
             return;
           } finally {
-            blockedMillis.addAndGet(sw.elapsed().toMillis());
+            blockedMillis.addAndGet(sw.elapsed(MILLISECONDS));
           }
         }
       }
